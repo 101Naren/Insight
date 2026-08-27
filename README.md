@@ -1,10 +1,40 @@
 # Insight
-An explainable ML predictive and eatly warning system for governement infrastrucre project monitoring.
 
-This is my project pitch for my college's Internal SIH hackathon (Make-A-Thon 4.0)
+INSIGHT is an explainable machine learning-based predictive and early-warning system designed for monitoring government infrastructure projects. Existing platforms such as PAIMANA by the Ministry of Statistics and Programme Implementation (MoSPI) maintain and monitor data on major government infrastructure projects. INSIGHT aims to build upon such monitoring by introducing a predictive approach to project risk management.
 
-The Idea or problem statement is simple # "Use case on web-based integrated project-monitoring platform".
+## Features
 
-Basically all I did in this project is create a predictive ML model which helps manage the risk factor of govt sanctioned project keep track of what factors are negatively affecting the progress of the project and help stop them early and get the project back on track.
+- Project Risk Prediction
+- Early Warning System
+- Explainable ML
+- Project Progress Monitoring
+- Risk Factor Identification
+- Interactive Dashboard
+- Centralised Project Management
+- Data-Driven Decision Support
 
-There already exists some programs which keep track of govt projects like PAIMANA by MOSPI from the Indian government which has a database of all projects undertaken by the government above 150 crores.
+## Project Structure
+
+```
+Insight/
+├── Database/
+│   ├── insight
+└── Datasets
+    └── demo_dataset.csv
+    └── test_dataset.csv
+    └── train_dataset.csv
+    └── README.txt
+├── Models/
+    └── models/
+            └── cost_overrun_model.pkl
+            └── time_overrun_model.pkl
+            └── 01_model.ipynb
+├── Results/
+      └── risk_results.csv
+      └── risk_results_with_alerts.csv
+├── src/
+      └── __pycache__/
+              └── app.cpython-314.pyc
+      └── app.py
+      └── Insight_logo.png
+├── Requirements.txt
