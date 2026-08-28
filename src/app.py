@@ -5,6 +5,8 @@ import joblib
 import sqlite3
 import shap
 import numpy as np
+import pydeck as pdk
+import requests
 
 from pathlib import Path
 from PIL import Image
@@ -100,6 +102,8 @@ def initialize_database():
             sector TEXT,
             ministry TEXT,
             state TEXT,
+            latitude REAL,
+            longitude REAL,
             implementing_agency_type TEXT,
 
             original_cost_crore REAL,
@@ -145,6 +149,35 @@ def initialize_database():
 
 
 initialize_database()
+
+
+# =========================================================
+# DATABASE MIGRATION FOR MAP FIELDS
+# =========================================================
+
+def ensure_location_columns():
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA table_info(project_snapshots)")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    if "latitude" not in columns:
+        cursor.execute(
+            "ALTER TABLE project_snapshots ADD COLUMN latitude REAL"
+        )
+
+    if "longitude" not in columns:
+        cursor.execute(
+            "ALTER TABLE project_snapshots ADD COLUMN longitude REAL"
+        )
+
+    conn.commit()
+    conn.close()
+
+
+ensure_location_columns()
 
 
 # =========================================================
@@ -216,6 +249,18 @@ def get_warning(score):
 
     else:
         return "NORMAL"
+
+
+def risk_color(level):
+
+    if level == "HIGH":
+        return [220, 53, 69, 190]
+
+    elif level == "MEDIUM":
+        return [255, 193, 7, 190]
+
+    else:
+        return [40, 167, 69, 190]
 
 
 # =========================================================
@@ -383,6 +428,366 @@ def get_combined_portfolio():
 
 
 # =========================================================
+# LLM PROJECT INTELLIGENCE ASSISTANT
+# =========================================================
+
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+OLLAMA_MODEL = "qwen2.5:3b"
+
+
+def build_assistant_context(combined_data, stored_data):
+
+    latest_portfolio = (
+        combined_data
+        .sort_values("reporting_month_sort")
+        .groupby("project_id")
+        .tail(1)
+        .copy()
+    )
+
+    portfolio_columns = [
+        "project_id",
+        "project_name",
+        "sector",
+        "cost_risk_probability",
+        "time_risk_probability",
+        "overall_risk_score",
+        "risk_level",
+        "early_warning"
+    ]
+
+    portfolio_context = (
+        latest_portfolio[portfolio_columns]
+        .sort_values("overall_risk_score", ascending=False)
+        .head(75)
+        .to_string(index=False)
+    )
+
+    stored_context = "No manually stored project details are available."
+
+    if not stored_data.empty:
+
+        stored_copy = stored_data.copy()
+        stored_copy["reporting_month_sort"] = pd.to_datetime(
+            stored_copy["reporting_month"],
+            errors="coerce"
+        )
+
+        stored_latest = (
+            stored_copy
+            .sort_values("reporting_month_sort")
+            .groupby("project_id")
+            .tail(1)
+            .copy()
+        )
+
+        detail_columns = [
+            "project_id",
+            "project_name",
+            "sector",
+            "ministry",
+            "state",
+            "original_cost_crore",
+            "cumulative_expenditure_crore",
+            "planned_duration_months",
+            "elapsed_duration_months",
+            "schedule_consumption_pct",
+            "expected_physical_progress_pct",
+            "physical_progress_pct",
+            "financial_progress_pct",
+            "progress_gap_pct",
+            "milestone_delay_rate_pct",
+            "land_acquisition_delay",
+            "clearance_delay",
+            "contractor_delay",
+            "funding_issue",
+            "cost_risk_probability",
+            "time_risk_probability",
+            "overall_risk_score",
+            "risk_level",
+            "early_warning"
+        ]
+
+        available_detail_columns = [
+            column for column in detail_columns
+            if column in stored_latest.columns
+        ]
+
+        stored_context = (
+            stored_latest[available_detail_columns]
+            .sort_values("overall_risk_score", ascending=False)
+            .head(50)
+            .to_string(index=False)
+        )
+
+    last_prediction_context = "No newly analysed project is active in this session."
+
+    if "last_prediction" in st.session_state:
+
+        prediction = st.session_state["last_prediction"]
+
+        cost_drivers = ", ".join(
+            clean_feature_name(item["feature"])
+            for item in prediction.get("cost_explanation", [])[:5]
+        )
+
+        time_drivers = ", ".join(
+            clean_feature_name(item["feature"])
+            for item in prediction.get("time_explanation", [])[:5]
+        )
+
+        last_prediction_context = f"""
+Project ID: {prediction.get('project_id')}
+Project Name: {prediction.get('project_name')}
+Cost Overrun Risk: {prediction.get('cost_risk', 0):.1f}%
+Time Overrun Risk: {prediction.get('time_risk', 0):.1f}%
+Overall Risk: {prediction.get('overall_risk', 0):.1f}%
+Risk Level: {prediction.get('risk_level')}
+Early Warning: {prediction.get('warning')}
+Top Cost Risk Drivers: {cost_drivers or 'Not available'}
+Top Time Risk Drivers: {time_drivers or 'Not available'}
+"""
+
+    return f"""
+PORTFOLIO LATEST SNAPSHOTS
+{portfolio_context}
+
+MANUALLY STORED PROJECT DETAILS
+{stored_context}
+
+MOST RECENTLY ANALYSED PROJECT IN THIS SESSION
+{last_prediction_context}
+"""
+
+
+def ask_insight_llm(question, language, context):
+
+    if language == "Auto-detect / Same as question":
+        language_instruction = (
+            "Reply in the same language used by the user in their latest question. "
+            "If the question mixes languages, use the dominant language."
+        )
+    else:
+        language_instruction = f"Reply in {language}."
+
+    history = st.session_state.get("insight_chat_history", [])[-6:]
+
+    history_text = "\n".join(
+        f"{item['role'].upper()}: {item['content']}"
+        for item in history
+    )
+
+    prompt = f"""
+You are Insight Assistant, a decision-support assistant for infrastructure project monitoring.
+
+Rules:
+1. Use the supplied Insight project data as the factual source for project-specific answers.
+2. Do not invent project IDs, risk scores, ministries, states, causes, or alerts.
+3. If the available data is insufficient, clearly say that the information is not available.
+4. The XGBoost models generate the risk predictions; you explain and communicate them.
+5. Keep the answer concise and useful.
+6. {language_instruction}
+
+INSIGHT DATA:
+{context}
+
+RECENT CONVERSATION:
+{history_text}
+
+USER QUESTION:
+{question}
+
+ANSWER:
+"""
+
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.2,
+                "num_predict": 250
+            }
+        },
+        timeout=(10, 120)
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if "response" not in result:
+        raise RuntimeError(
+            f"Ollama returned an unexpected response: {result}"
+        )
+
+    return result["response"].strip()
+
+def render_global_assistant(combined_data, stored_data):
+
+    if "insight_chat_history" not in st.session_state:
+        st.session_state["insight_chat_history"] = []
+
+    # Best-effort floating placement for the global assistant button.
+    # If Streamlit changes its internal markup, the popover still works
+    # normally at its rendered position.
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stPopover"] {
+            z-index: 9999;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    assistant_left, assistant_right = st.columns([8, 2])
+
+    with assistant_right:
+
+        with st.popover(
+            "🤖 Can I help you?",
+            use_container_width=True
+        ):
+
+            st.markdown("### Insight Assistant")
+            st.caption(
+                "Ask about project risk, alerts, sectors, progress, "
+                "stored projects, or recently analysed projects."
+            )
+
+            language = st.selectbox(
+                "Response language",
+                [
+                    "Auto-detect / Same as question",
+                    "English",
+                    "Hindi",
+                    "Kannada",
+                    "Tamil",
+                    "Telugu",
+                    "Marathi",
+                    "Bengali"
+                ],
+                key="assistant_language"
+            )
+
+            st.caption(
+                f"Local model: {OLLAMA_MODEL} via Ollama"
+            )
+
+            history_box = st.container(height=320)
+
+            with history_box:
+
+                if not st.session_state["insight_chat_history"]:
+                    st.info(
+                        "Try: ‘Which projects need immediate attention?’ "
+                        "or ask the same question in your local language."
+                    )
+
+                for message in st.session_state["insight_chat_history"]:
+                    with st.chat_message(message["role"]):
+                        st.markdown(message["content"])
+
+            with st.form("global_assistant_form", clear_on_submit=True):
+
+                question = st.text_input(
+                    "Message",
+                    placeholder="Ask Insight about your projects...",
+                    label_visibility="collapsed"
+                )
+
+                send_col, clear_col = st.columns([3, 1])
+
+                with send_col:
+                    send = st.form_submit_button(
+                        "Send",
+                        use_container_width=True
+                    )
+
+                with clear_col:
+                    clear = st.form_submit_button(
+                        "Clear",
+                        use_container_width=True
+                    )
+
+            if clear:
+                st.session_state["insight_chat_history"] = []
+                st.rerun()
+
+            if send and question.strip():
+
+                st.session_state["insight_chat_history"].append(
+                    {
+                        "role": "user",
+                        "content": question.strip()
+                    }
+                )
+
+                context = build_assistant_context(
+                    combined_data,
+                    stored_data
+                )
+
+                try:
+                    answer = ask_insight_llm(
+                        question.strip(),
+                        language,
+                        context
+                    )
+
+                    if not answer:
+                        answer = (
+                            "The local language model returned an empty response. "
+                            "Please try again."
+                        )
+
+                except requests.exceptions.ConnectionError as exc:
+                    answer = (
+                        "Insight could not connect to Ollama at "
+                        f"{OLLAMA_URL}. The Ollama API works only if this Streamlit "
+                        "app is running on the same computer. "
+                        f"Technical detail: {exc}"
+                    )
+
+                except requests.exceptions.Timeout:
+                    answer = (
+                        "Ollama connected, but the response took too long. "
+                        "Please try the question again."
+                    )
+
+                except requests.exceptions.HTTPError as exc:
+                    answer = (
+                        "Ollama returned an HTTP error. "
+                        f"Technical detail: {exc}"
+                    )
+
+                except requests.exceptions.RequestException as exc:
+                    answer = (
+                        "The Ollama request failed. "
+                        f"Technical detail: {exc}"
+                    )
+
+                except Exception as exc:
+                    answer = (
+                        "The assistant encountered an error while generating the response: "
+                        f"{exc}"
+                    )
+
+                st.session_state["insight_chat_history"].append(
+                    {
+                        "role": "assistant",
+                        "content": answer
+                    }
+                )
+
+                st.rerun()
+
+
+# =========================================================
 # HEADER
 # =========================================================
 
@@ -426,6 +831,16 @@ dashboard_tab, add_tab, stored_tab = st.tabs(
 # =========================================================
 
 combined_data, stored_data = get_combined_portfolio()
+
+
+# =========================================================
+# GLOBAL LLM ASSISTANT - AVAILABLE ON ALL TABS
+# =========================================================
+
+render_global_assistant(
+    combined_data,
+    stored_data
+)
 
 
 # =========================================================
@@ -492,6 +907,107 @@ with dashboard_tab:
         "Average Risk",
         f"{average_risk:.1f}%"
     )
+
+
+    st.divider()
+
+
+    # -----------------------------------------------------
+    # INFRASTRUCTURE PROJECT RISK MAP
+    # -----------------------------------------------------
+
+    st.subheader(
+        "🗺️ Infrastructure Project Risk Map"
+    )
+
+    map_data = load_stored_projects()
+
+    if not map_data.empty:
+        map_data = map_data.dropna(
+            subset=["latitude", "longitude"]
+        ).copy()
+
+    if not map_data.empty:
+
+        map_data["reporting_month_sort"] = pd.to_datetime(
+            map_data["reporting_month"],
+            errors="coerce"
+        )
+
+        map_data = (
+            map_data
+            .sort_values("reporting_month_sort")
+            .groupby("project_id")
+            .tail(1)
+            .copy()
+        )
+
+        map_data["color"] = map_data["risk_level"].apply(risk_color)
+
+        map_data["overall_risk_display"] = (
+            map_data["overall_risk_score"].round(1)
+        )
+
+        map_data["cost_risk_display"] = (
+            map_data["cost_risk_probability"].round(1)
+        )
+
+        map_data["time_risk_display"] = (
+            map_data["time_risk_probability"].round(1)
+        )
+
+        map_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=map_data,
+            get_position="[longitude, latitude]",
+            get_fill_color="color",
+            get_radius=30000,
+            pickable=True,
+            auto_highlight=True
+        )
+
+        map_view = pdk.ViewState(
+            latitude=float(map_data["latitude"].mean()),
+            longitude=float(map_data["longitude"].mean()),
+            zoom=4.5,
+            pitch=0
+        )
+
+        map_tooltip = {
+            "html": '''
+                <b>{project_name}</b><br/>
+                Project ID: {project_id}<br/>
+                Sector: {sector}<br/>
+                Risk Level: {risk_level}<br/>
+                Overall Risk: {overall_risk_display}%<br/>
+                Cost Risk: {cost_risk_display}%<br/>
+                Time Risk: {time_risk_display}%
+            '''
+        }
+
+        deck = pdk.Deck(
+            layers=[map_layer],
+            initial_view_state=map_view,
+            tooltip=map_tooltip
+        )
+
+        st.pydeck_chart(
+            deck,
+            use_container_width=True
+        )
+
+        st.markdown(
+            "**Legend:** 🔴 High Risk &nbsp;&nbsp; "
+            "🟡 Medium Risk &nbsp;&nbsp; "
+            "🟢 Low Risk"
+        )
+
+    else:
+
+        st.info(
+            "No stored projects with latitude and longitude are available yet. "
+            "Add a new project with location coordinates to display it on the map."
+        )
 
 
     st.divider()
@@ -1017,6 +1533,22 @@ with add_tab:
 
             reporting_month = st.date_input(
                 "Reporting Date"
+            )
+
+            latitude = st.number_input(
+                "Latitude",
+                min_value=-90.0,
+                max_value=90.0,
+                value=12.9716,
+                format="%.6f"
+            )
+
+            longitude = st.number_input(
+                "Longitude",
+                min_value=-180.0,
+                max_value=180.0,
+                value=77.5946,
+                format="%.6f"
             )
 
 
@@ -1565,6 +2097,12 @@ with add_tab:
 
                         "state":
                             state,
+
+                        "latitude":
+                            latitude,
+
+                        "longitude":
+                            longitude,
 
                         "implementing_agency_type":
                             agency,

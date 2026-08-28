@@ -7,3 +7,5 @@ scikit-learn
 xgboost
 shap
 Pillow
+pydeck
+requests
